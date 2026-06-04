@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Subal Ghimire | Structured Neobrutalist</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-color: #f4f4f0;
+            --text-main: #000000;
+            --accent-yellow: #ffde59;
+            --accent-pink: #ff6b6b;
+            --accent-blue: #4ecdc4;
+            --accent-green: #c7f464;
+            --accent-purple: #c4a1ff;
+            --border-thick: 3px solid #000000;
+            --border-thin: 2px solid #000000;
+            --shadow-hard: 5px 5px 0px #000000;
+            --shadow-hard-hover: 8px 8px 0px #000000;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Space Grotesk', sans-serif;
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+        
+        /* Hide citations to keep design clean */
+        .cit { display: none; }
+
+        /* Layout */
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 4rem 2rem;
+        }
+
+        /* Typography */
+        h1 {
+            font-size: clamp(3rem, 8vw, 6rem);
+            font-weight: 700;
+            line-height: 1;
+            text-transform: uppercase;
+            margin-bottom: 2rem;
+            letter-spacing: -1px;
+        }
+
+        .section-title {
+            font-size: 2rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin: 4rem 0 2rem 0;
+            display: inline-block;
+            background: var(--text-main);
+            color: var(--bg-color);
+            padding: 0.5rem 1rem;
+            border: var(--border-thick);
+            box-shadow: var(--shadow-hard);
+        }
+
+        /* Bio Box */
+        .bio-box {
+            background: #ffffff;
+            border: var(--border-thick);
+            box-shadow: var(--shadow-hard);
+            padding: 2.5rem;
+            font-size: 1.25rem;
+            font-weight: 500;
+            margin-bottom: 4rem;
+        }
+
+        /* Experience Cards */
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+        }
+
+        .card {
+            background: #ffffff;
+            border: var(--border-thick);
+            box-shadow: var(--shadow-hard);
+            padding: 2rem;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .card:hover {
+            transform: translate(-3px, -3px);
+            box-shadow: var(--shadow-hard-hover);
+        }
+
+        .card-header {
+            border-bottom: var(--border-thin);
+            padding-bottom: 1rem;
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .company {
+            font-size: 1.5rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .role {
+            font-size: 1rem;
+            font-weight: 600;
+            background: var(--accent-yellow);
+            color: #000;
+            padding: 0.2rem 0.8rem;
+            display: inline-block;
+            margin-bottom: 1rem;
+            border: var(--border-thin);
+        }
+
+        .date {
+            font-weight: 600;
+            font-size: 1rem;
+            color: #444;
+        }
+
+        ul.brutal-list {
+            list-style: none;
+        }
+
+        ul.brutal-list li {
+            position: relative;
+            padding-left: 1.5rem;
+            margin-bottom: 0.75rem;
+            font-size: 1.05rem;
+            font-weight: 400;
+        }
+
+        ul.brutal-list li::before {
+            content: '→';
+            position: absolute;
+            left: 0;
+            font-weight: 700;
+        }
+
+        /* Projects & Skills Grid (2 Columns) */
+        .projects-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 2rem;
+        }
+
+        /* Skills Tags */
+        .skills-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+
+        .skill-tag {
+            font-size: 0.95rem;
+            font-weight: 600;
+            padding: 0.4rem 0.8rem;
+            background: #fff;
+            border: var(--border-thin);
+            box-shadow: 3px 3px 0px #000;
+            transition: all 0.2s ease;
+        }
+
+        .skill-tag:hover {
+            background: var(--text-main);
+            color: var(--bg-color);
+            transform: translate(-2px, -2px);
+            box-shadow: 5px 5px 0px var(--accent-blue);
+        }
+
+        /* Footer / Contact */
+        .footer {
+            margin-top: 6rem;
+            padding-top: 4rem;
+            border-top: var(--border-thick);
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .contact-link {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text-main);
+            text-decoration: none;
+            text-transform: uppercase;
+            border: var(--border-thick);
+            background: #fff;
+            padding: 1rem;
+            text-align: center;
+            box-shadow: var(--shadow-hard);
+            transition: all 0.2s ease;
+        }
+
+        .contact-link:hover {
+            background: var(--accent-green);
+            transform: translate(-3px, -3px);
+            box-shadow: var(--shadow-hard-hover);
+        }
+
+        .location-badge {
+            display: inline-block;
+            font-size: 1rem;
+            font-weight: 600;
+            background: #fff;
+            padding: 0.5rem 1rem;
+            border: var(--border-thick);
+            box-shadow: 3px 3px 0 #000;
+            margin-bottom: 2rem;
+            text-transform: uppercase;
+        }
+
+        @media (max-width: 768px) {
+            .bio-box { font-size: 1.1rem; padding: 1.5rem; }
+            .section-title { font-size: 1.5rem; margin: 3rem 0 1.5rem 0; }
+            .company { font-size: 1.25rem; }
+            h1 { font-size: 3.5rem; }
+            .projects-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        
+        <!-- Hero Section -->
+        <div class="location-badge">📍 Biratnagar, Nepal<span class="cit">[cite: 2]</span></div>
+        <h1>SUBAL<br>GHIMIRE<span class="cit">[cite: 2]</span></h1>
+        
+        <!-- Contact Links -->
+        <div class="footer" style="margin-bottom: 4rem; margin-top: 2rem; padding-top: 0; border-top: none;">
+            <a href="mailto:subal.ghimire2396@gmail.com" class="contact-link">EMAIL ↗<span class="cit">[cite: 2]</span></a>
+            <a href="https://linkedin.com/in/subalghimire" target="_blank" class="contact-link" style="background: var(--accent-blue);">LINKEDIN ↗<span class="cit">[cite: 2]</span></a>
+            <a href="https://github.com/subal000" target="_blank" class="contact-link" style="background: var(--accent-green);">GITHUB ↗<span class="cit">[cite: 2]</span></a>
+        </div>
+        
+        <div class="bio-box">
+            <p>I'm a Data Engineer focused on backend architecture and high-throughput data infrastructure<span class="cit">[cite: 2]</span>. I specialize in building real-time streaming pipelines and production-grade blockchain indexers<span class="cit">[cite: 2]</span>. Currently, I'm deeply enthusiastic about the intersection of data and AI, specifically exploring agentic engineering and building autonomous AI systems. Whether I'm optimizing state backends or prototyping new AI agents, I like turning complex, high-velocity problems into clean, functional systems.</p>
+        </div>
+
+        <!-- Experience -->
+        <h2 class="section-title">EXPERIENCE</h2>
+        
+        <div class="grid">
+            <div class="card">
+                <div class="card-header">
+                    <div class="company">KAVAYA RESEARCH<span class="cit">[cite: 2]</span></div>
+                    <div class="date">APR 2024 - PRESENT</div>
+                </div>
+                <div class="role" style="background: var(--accent-blue);">SOFTWARE ENGINEER (DATA & BLOCKCHAIN)</div>
+                <ul class="brutal-list">
+                    <li><strong>Data, Orchestration & Automation:</strong> Built scalable ETL pipelines using DBT<span class="cit">[cite: 2]</span>. Orchestrated workflows with Prefect<span class="cit">[cite: 2]</span>, Plombery<span class="cit">[cite: 2]</span>, and Blueberry. Engineered robust web scraping and session-based Twitter list fetchers utilizing <strong>Golang Rod</strong> and Selenium. Scheduled fault-tolerant task execution via Celery and asynq<span class="cit">[cite: 2]</span>.</li>
+                    <li><strong>Blockchain & Infrastructure:</strong> Developed production-grade Solana indexers in Go with Benthos<span class="cit">[cite: 2]</span> and Subsquid. Engineered a Kafka-driven smart wallet detection layer<span class="cit">[cite: 2]</span> with real-time Discord alerting. Built a highly available, gRPC-first RPC rotator featuring active health checks and automatic fallbacks. Built chain-agnostic smart contract APIs using FastAPI, Express.js<span class="cit">[cite: 2]</span>, and Golang.</li>
+                    <li><strong>Trading Systems & Architecture:</strong> Architected a Backtesting Engine featuring a shared, extensible indicator library (SMA, etc.) for quantitative researchers. Developed a Dockerized strategy runner driven by YAML configurations and synthetic market data.</li>
+                    <li><strong>LLM & Applied AI:</strong> Integrated OpenAI Whisper<span class="cit">[cite: 2]</span> and LangGraph<span class="cit">[cite: 2]</span> for sentiment and intent detection across Web3 social streams<span class="cit">[cite: 2]</span> utilizing Llama, Phi, and DeepSeek<span class="cit">[cite: 2]</span>.</li>
+                    <li><strong>DevOps & Reliability:</strong> Implemented CI/CD pipelines (Docker, GitHub Actions<span class="cit">[cite: 2]</span>), automated deployments (Dokploy, Coolify<span class="cit">[cite: 2]</span>), and integrated Sentry for runtime error tracking<span class="cit">[cite: 2]</span>.</li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="company">STARBOY SOLUTIONS<span class="cit">[cite: 2]</span></div>
+                    <div class="date">2023 - 2024<span class="cit">[cite: 2]</span></div>
+                </div>
+                <div class="role" style="background: var(--accent-pink);">COMMUNITY & AUTOMATION<span class="cit">[cite: 2]</span></div>
+                <ul class="brutal-list">
+                    <li>Developed automation bots for engagement analytics and bot detection across Telegram and Discord communities<span class="cit">[cite: 2]</span>.</li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="company">TECH COMMUNITY NEPAL<span class="cit">[cite: 2]</span></div>
+                    <div class="date">FEB - MAY 2021<span class="cit">[cite: 2]</span></div>
+                </div>
+                <div class="role" style="background: var(--accent-green);">ANDROID DEV INTERN<span class="cit">[cite: 2]</span></div>
+                <ul class="brutal-list">
+                    <li>Built Android applications in Kotlin/Java with a focus on UI/UX optimization and performance<span class="cit">[cite: 2]</span>.</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Community Section -->
+        <h2 class="section-title">COMMUNITY</h2>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-header">
+                    <div class="company">SUPERTEAM NEPAL</div>
+                    <div class="date">JUN 2026 - PRESENT</div>
+                </div>
+                <div class="role" style="background: var(--accent-purple);">MEMBER & CONTRIBUTOR</div>
+                <ul class="brutal-list">
+                    <li>Active <strong>Solana and blockchain enthusiast</strong>, contributing to the growth and development of the local Web3 ecosystem.</li>
+                    <li>Participated in the <strong>Solana Frontier Hackathon</strong>, building and deploying decentralized solutions.</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Projects Section -->
+        <h2 class="section-title">PROTOTYPES & ARCHITECTURE</h2>
+        
+        <div class="projects-grid">
+            <div class="card">
+                <div class="role" style="background: var(--accent-yellow);">AV ENGINE</div>
+                <p style="font-size: 1.05rem;">A scalable media ingestion pipeline designed for transcription and analysis via <strong>OpenAI Whisper</strong>, <strong>Celery</strong>, and <strong>Kafka</strong><span class="cit">[cite: 2]</span>.</p>
+            </div>
+
+            <div class="card">
+                <div class="role" style="background: var(--accent-pink);">SOCIAL STREAM MONITORS<span class="cit">[cite: 2]</span></div>
+                <p style="font-size: 1.05rem;">A multi-platform, real-time data extraction pipeline utilizing <strong>Kafka</strong> and <strong>PostgreSQL</strong>, specifically engineered for tracking contextual Web3 events across social networks<span class="cit">[cite: 2]</span>.</p>
+            </div>
+            
+            <div class="card">
+                <div class="role" style="background: var(--accent-blue);">SOLANA INDEXER<span class="cit">[cite: 2]</span></div>
+                <p style="font-size: 1.05rem;">A custom <strong>Go-based</strong> indexer equipped with a Benthos pipeline for decoding on-chain program interactions and token flow analytics directly into <strong>ClickHouse</strong><span class="cit">[cite: 2]</span>.</p>
+            </div>
+        </div>
+
+        <!-- Skills -->
+        <h2 class="section-title">SKILLS MATRIX</h2>
+        
+        <div class="projects-grid">
+            
+            <div class="card" style="padding: 1.5rem;">
+                <div class="role" style="background: var(--accent-yellow); margin-bottom: 0;">LANGUAGES</div>
+                <div class="skills-container">
+                    <div class="skill-tag">PYTHON<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">GOLANG<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">JAVA<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">TYPESCRIPT<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">RUST<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">SQL<span class="cit">[cite: 2]</span></div>
+                </div>
+            </div>
+
+            <div class="card" style="padding: 1.5rem;">
+                <div class="role" style="background: var(--accent-blue); margin-bottom: 0;">DATA & BACKEND</div>
+                <div class="skills-container">
+                    <div class="skill-tag">APACHE FLINK<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">APACHE SPARK<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">KAFKA<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">NATS JETSTREAM<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">CLICKHOUSE<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">STARROCKS<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">FASTAPI</div>
+                    <div class="skill-tag">NODE.JS</div>
+                    <div class="skill-tag">EXPRESS.JS<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">gRPC</div>
+                </div>
+            </div>
+
+            <div class="card" style="padding: 1.5rem;">
+                <div class="role" style="background: var(--accent-green); margin-bottom: 0;">ORCHESTRATION & AUTOMATION</div>
+                <div class="skills-container">
+                    <div class="skill-tag">DBT<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">PREFECT<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">CELERY<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">ASYNQ<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">PLOMBERY<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">BLUEBERRY</div>
+                    <div class="skill-tag">GOLANG ROD</div>
+                    <div class="skill-tag">SELENIUM</div>
+                </div>
+            </div>
+
+            <div class="card" style="padding: 1.5rem;">
+                <div class="role" style="background: var(--accent-purple); margin-bottom: 0;">BLOCKCHAIN & WEB3</div>
+                <div class="skills-container">
+                    <div class="skill-tag">ON-CHAIN INDEXING</div>
+                    <div class="skill-tag">TRANSACTION DECODING</div>
+                    <div class="skill-tag">SOLANA ARCHITECTURE</div>
+                    <div class="skill-tag">WEB3 INFRASTRUCTURE</div>
+                    <div class="skill-tag">SUBSQUID</div>
+                    <div class="skill-tag">SMART WALLET TRACKING</div>
+                </div>
+            </div>
+
+            <div class="card" style="padding: 1.5rem;">
+                <div class="role" style="background: var(--accent-pink); margin-bottom: 0;">AI & AGENTIC</div>
+                <div class="skills-container">
+                    <div class="skill-tag">LANGGRAPH<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">OPENAI WHISPER<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">NLP</div>
+                </div>
+            </div>
+
+            <div class="card" style="padding: 1.5rem;">
+                <div class="role" style="background: var(--accent-yellow); margin-bottom: 0;">DEVOPS & TESTING</div>
+                <div class="skills-container">
+                    <div class="skill-tag">DOCKER<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">DOKPLOY</div>
+                    <div class="skill-tag">COOLIFY<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">GITHUB ACTIONS<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">SENTRY<span class="cit">[cite: 2]</span></div>
+                    <div class="skill-tag">YAML</div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+</body>
+</html>
