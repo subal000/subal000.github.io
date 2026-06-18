@@ -64,19 +64,12 @@
 
     <div class="card">
     <h1 id="how-we-handled-10k-events-per-second-in-flink-without-crashing-our-db">How we handled 10k events per second in Flink without crashing our DB</h1>
-<p>When you are processing thousands of financial events every second from Kafka, you quickly realize the biggest enemy is not the math, it is network latency.</p>
-<p>To get useful data out of our stream, we had to do three things for every single transaction in real time:</p>
-<ol>
-<li>Calculate the USD value using a volatile price.</li>
-<li>Map the fromToken to a human-readable name.</li>
-<li>Map the toToken to a human-readable name.</li>
-</ol>
-<p>The easy way is just writing a map function that hits an API or Redis for every record. That works fine on your laptop with 5 events a second. But when you hit 10k events a second in production, your database connections just give up, you burn through your API limits, and your Kafka lag shoots through the roof.</p>
-<p>We fixed this by using Flink’s built-in stateful features to make a self-sustaining pipeline. Here is how we got rid of the external network calls and handled complex, multi-key joins right in the cluster memory.</p>
+<p>When you are processing thousands of financial events every second from Kafka, the biggest enemy is not the math. It is network latency. And the worst part is that the naive solution works perfectly until it doesn&#39;t. Five events per second on your laptop: fine. Five hundred in staging: fine. Ten thousand in production on a Monday morning: your database connection pool is exhausted, your API rate limits are blown, and your Kafka consumer group lag is climbing faster than you can read it.</p>
+<p>This is the story of how we fixed that for a real-time DEX swap enrichment pipeline on Solana.</p>
 <hr>
-<h2 id="the-setup-dex-swaps">The setup: DEX swaps</h2>
-<p>To give you an idea of the data we were dealing with, we were processing real-time DEX swap data from the Solana blockchain, flowing out of a Kafka topic.</p>
-<p>A raw payload looks like this:</p>
+<h2 id="what-we-were-building-and-why-it-is-harder-than-it-sounds">What we were building, and why it is harder than it sounds</h2>
+<p>A decentralized exchange (DEX) swap is a transaction where a user trades one token for another directly on-chain, without a centralized intermediary. On Solana, these happen constantly -- thousands per second across dozens of liquidity pools. We were ingesting raw swap events from Kafka and needed to turn them into analytics-ready records in StarRocks before downstream dashboards could use them.</p>
+<p>A raw event looks like this:</p>
 <pre><code class="lang-json">{
   <span class="hljs-attr">"signature"</span>: <span class="hljs-string">"3ucNos4Nbum..."</span>,
   <span class="hljs-attr">"from_mint"</span>: <span class="hljs-string">"So11111111111111111111111111111111111111112"</span>,
@@ -85,54 +78,290 @@
   <span class="hljs-attr">"to_amount"</span>: <span class="hljs-number">2100.25</span>
 }
 </code></pre>
-<p>This payload is small and fast. But to make it useful for analytics in StarRocks, we need those token symbols (turning <code>So1111...</code> into <code>SOL</code>) and the dollar value. Since new tokens pop up all the time, we couldnt just hardcode them. We had to build something dynamic that didnt rely on blocking network calls.</p>
+<p>That payload is compact and fast. But to make it useful for analytics, we needed three things for every single record:</p>
+<ol>
+<li>The USD value of the trade. Without this, you cannot aggregate volume or compare trades across different token pairs.</li>
+<li>A human-readable symbol for <code>from_mint</code>. <code>So1111...</code> means nothing to an analyst. <code>SOL</code> does.</li>
+<li>A human-readable symbol for <code>to_mint</code>. Same problem, different token address.</li>
+</ol>
+<p>The obvious solution -- hitting a price API and a token metadata API for every record -- works until throughput climbs. Then it falls apart in three ways simultaneously: your API provider rate-limits you, your database connection pool runs out of connections, and Kafka lag accumulates because your pipeline is spending most of its time waiting on network I/O rather than processing records. We hit all three on the same day.</p>
+<p>The fix required rethinking where state lives and how joins work inside Flink.</p>
+<hr>
+<h2 id="pipeline-overview">Pipeline overview</h2>
+<p>Before getting into each component, here is the full shape of the pipeline:</p>
+<pre><code>+---------------------------+
+|<span class="hljs-string">   Kafka topic             </span>|
+|<span class="hljs-string">   exchange-data           </span>|
++---------------------------+
+         |<span class="hljs-string">
+         </span>|<span class="hljs-string">  (raw ExchangeData events)
+         </span>|
+         +-----------------------------+
+         |<span class="hljs-string">                             </span>|
+         v                             v
++-------------------+     +--------------------------+
+|<span class="hljs-string"> SolPriceExtractor </span>|<span class="hljs-string">     </span>|<span class="hljs-string">   UsdValueCalculator     </span>|
+|<span class="hljs-string"> flatMap on SOL/   </span>|<span class="hljs-string">----&gt;</span>|<span class="hljs-string">   BroadcastProcessFn     </span>|
+|<span class="hljs-string"> USDC pools        </span>|<span class="hljs-string"> bcast</span>|<span class="hljs-string">  rolling avg (last 20)  </span>|
++-------------------+     +--------------------------+
+                                       |<span class="hljs-string">
+                                       </span>|<span class="hljs-string">  SwapWithPrice
+                                       v
+                   +-----------------------------------+
+                   </span>|<span class="hljs-string"> StarRocks token_metadata table    </span>|
+                   |<span class="hljs-string"> (pre-loaded as side input stream) </span>|
+                   +-----------------------------------+
+                           |<span class="hljs-string">               </span>|
+              keyBy(fromToken)         keyBy(address)
+                           |<span class="hljs-string">               </span>|
+                           v               |<span class="hljs-string">
+                   +---------------------------+
+                   </span>|<span class="hljs-string"> EnrichFromSymbolFunction  </span>|
+                   |<span class="hljs-string"> KeyedCoProcessFunction    </span>|
+                   |<span class="hljs-string"> RocksDB state cache       </span>|
+                   +---------------------------+
+                                |<span class="hljs-string">
+                                </span>|<span class="hljs-string">  SwapWithFromSymbol
+                                </span>|<span class="hljs-string">  (network reshuffle)
+                                v
+                   +---------------------------+
+                   </span>|<span class="hljs-string"> EnrichToSymbolFunction    </span>|
+                   |<span class="hljs-string"> KeyedCoProcessFunction    </span>|
+                   |<span class="hljs-string"> RocksDB state cache       </span>|
+                   +---------------------------+
+                                |<span class="hljs-string">
+                                </span>|<span class="hljs-string">  OutputSwapData
+                                v
+                   +---------------------------+
+                   </span>|<span class="hljs-string"> OutputSwapDataToJsonMapper</span>|
+                   +---------------------------+
+                          |<span class="hljs-string">           </span>|
+              +-----------+           +-----------+
+              v                                   v
+  +-------------------+               +---------------------+
+  |<span class="hljs-string"> Kafka sink        </span>|<span class="hljs-string">               </span>|<span class="hljs-string"> StarRocks sink      </span>|
+  |<span class="hljs-string"> enriched-swaps-v2 </span>|<span class="hljs-string">               </span>|<span class="hljs-string"> enriched_swaps_v2   </span>|
+  +-------------------+               +---------------------+
+
+  SINK_TYPE param selects KAFKA, STARROCKS, or ALL (default)
+</code></pre><p>Each section below maps to one stage of this diagram.</p>
 <hr>
 <h2 id="1-building-our-own-in-stream-price-oracle">1. Building our own in-stream price oracle</h2>
-<p>Instead of reaching out to a price API for every event, we realized the market price was already inside our stream because of the high liquidity trading pools.</p>
-<p>We used a two step pattern: <strong>Extract and Broadcast.</strong></p>
-<p>We skimmed high volume pools using a flat-mapper (<code>SolPriceExtractor</code>). Whenever a trade between our main asset and a stablecoin happened, we calculated the price and threw it into a pricing stream. Then we used Flink&#39;s <code>BroadcastStream</code> to push that price to every parallel worker in the cluster, keeping the state local to the execution memory.</p>
-<pre><code class="lang-java">// Skim the price out of the raw traffic <span class="hljs-keyword">and </span><span class="hljs-keyword">broadcast </span><span class="hljs-keyword">it
-</span><span class="hljs-keyword">BroadcastStream&lt;PoolPriceData&gt; </span><span class="hljs-keyword">broadcastPriceStream </span>= exchangeStream
-        .flatMap(new SolPriceExtractor())
-        .<span class="hljs-keyword">broadcast(priceStateDescriptor);
-</span>
-// Connect <span class="hljs-keyword">it </span><span class="hljs-keyword">back </span>to the main processing engine
-<span class="hljs-symbol">DataStream</span>&lt;SwapWithPrice&gt; <span class="hljs-keyword">streamWithSolPrice </span>= exchangeStream
-        .connect(<span class="hljs-keyword">broadcastPriceStream)
-</span>        .process(new UsdValueCalculator())<span class="hljs-comment">;</span>
+<p>The first instinct when you need a price feed is to call an external API -- DexScreener, CoinGecko, whatever. The problem is that at 10k events per second, even a cached API call with a 1-second TTL is still 10,000 cache reads per second. That is load you do not need to put on anything external.</p>
+<p>The price was already inside our stream. Because high-liquidity pools like the SOL/USDC pair on Orca trade constantly, every few milliseconds there is a swap event that implicitly encodes the current market price. If someone swaps 15.5 SOL for 2100.25 USDC, the price of SOL at that moment is <code>2100.25 / 15.5 = ~$135.50</code>. We were throwing that information away.</p>
+<p>We fixed this with a two-step pattern: extract, then broadcast.</p>
+<pre><code>Raw event stream
+       <span class="hljs-string">|</span>
+       <span class="hljs-string">| flatMap (filter to known SOL/USDC pools)</span>
+       v
+  PoolPriceData stream
+       <span class="hljs-string">|</span>
+       <span class="hljs-string">| .broadcast(priceStateDescriptor)</span>
+       v
+  BroadcastStream&lt;PoolPriceData&gt;
+       <span class="hljs-string">|</span>
+       <span class="hljs-string">| .connect(exchangeStream).process(UsdValueCalculator)</span>
+       v
+  SwapWithPrice stream
+</code></pre><p>First, we defined the pools we trusted as price sources -- high-volume, well-established SOL/USDC and SOL/USDT pools where the price signal is reliable:</p>
+<pre><code class="lang-java"><span class="hljs-keyword">final</span> <span class="hljs-keyword">static</span> <span class="hljs-built_in">Set</span>&lt;<span class="hljs-built_in">String</span>&gt; SOL_USDC_POOLS = <span class="hljs-keyword">new</span> HashSet&lt;&gt;(Arrays.asList(
+    <span class="hljs-string">"Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"</span>,
+    <span class="hljs-string">"58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"</span>,
+    <span class="hljs-string">"FbkX1h2YTs171cEMa4GrV7XbAiQt5zSmV2CjfYWxXJDP"</span>,
+    <span class="hljs-string">"HSTnyz57adepabCQyfmMST5eKfAsi6prAN1Ch2St8J7P"</span>
+));
 </code></pre>
-<p>To keep things smooth, our <code>UsdValueCalculator</code> maintains a rolling list of the last 20 prices in memory. By averaging this, we get zero-latency pricing. If the pipeline just started and the state was empty, we had a simple defensive fallback that hit an API with a 60 second cache, just enough to keep the stream moving until the local broadcast state caught up.</p>
-<hr>
-<h2 id="2-solving-the-multi-key-join-paradox">2. Solving the multi-key join paradox</h2>
-<p>Once we had the pricing, we hit a Flink bottleneck. Each swap event needs metadata for two distinct tokens (<code>fromToken</code> and <code>toToken</code>).</p>
-<p>The problem is that in Flink, you can only <code>keyBy</code> on one key at a time. You cant route a single record to two places at once without causing massive network shuffles or data duplication. We fixed this by turning the enrichment into a two-stage assembly line.</p>
-<ul>
-<li><strong>Stage 1:</strong> We partition the stream by <code>fromToken</code> and route it to <code>EnrichFromSymbolFunction</code>. It checks local RocksDB state (pre-loaded from our analytics warehouse). If it hits, it appends the symbol. If not, it hits an API and saves it for next time.</li>
-<li><strong>The handoff:</strong> We wrap the result in a temporary <code>SwapWithFromSymbol</code> POJO. Then, we force the stream to <strong>reshuffle</strong> across the network, this time using the <code>toToken</code> as our routing key.</li>
-<li><strong>Stage 2:</strong> The stream hits <code>EnrichToSymbolFunction</code>. It performs the same RocksDB lookup for the second token.</li>
-</ul>
-<p>By breaking a multi-dimensional join into this pipelined sequence, we kept everything in memory and avoided the massive cost of hitting a database twice for every single row.</p>
-<hr>
-<h2 id="3-dynamic-topology">3. Dynamic topology</h2>
-<p>Finally, we wanted to be able to change where our data lands without rewriting our code. We added a simple parameter <code>SINK_TYPE</code> that lets us decide where the data goes when we deploy.</p>
-<pre><code class="lang-java">String sinkType = <span class="hljs-keyword">params</span>.<span class="hljs-keyword">get</span>(<span class="hljs-string">"SINK_TYPE"</span>, <span class="hljs-string">"kafka"</span>);
-
-<span class="hljs-keyword">if</span> (<span class="hljs-string">"kafka"</span>.equalsIgnoreCase(sinkType)) {
-    enrichedStream.sinkTo(createKafkaSink(<span class="hljs-keyword">params</span>));
-} <span class="hljs-function"><span class="hljs-keyword">else</span> <span class="hljs-title">if</span> (<span class="hljs-params"><span class="hljs-string">"starrocks"</span>.equalsIgnoreCase(sinkType</span>)) </span>{
-    enrichedStream.addSink(createStarRocksSink(<span class="hljs-keyword">params</span>));
+<p>Then we used a <code>FlatMapFunction</code> called <code>SolPriceExtractor</code> to skim price signals out of the main event stream. The price calculation handles both trade directions (SOL to USDC and USDC to SOL):</p>
+<pre><code class="lang-java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">SolPriceExtractor</span> <span class="hljs-keyword">implements</span> <span class="hljs-title">FlatMapFunction</span>&lt;<span class="hljs-title">ExchangeData</span>, <span class="hljs-title">PoolPriceData</span>&gt; </span>{
+    <span class="hljs-meta">@Override</span>
+    <span class="hljs-function"><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">flatMap</span><span class="hljs-params">(ExchangeData exchange, Collector&lt;PoolPriceData&gt; out)</span> </span>{
+        <span class="hljs-keyword">if</span> (SOL_USDC_POOLS.contains(exchange.pair)) {
+            <span class="hljs-keyword">double</span> solPrice = <span class="hljs-number">0.0</span>;
+            <span class="hljs-keyword">if</span> (SOL_ADDRESS.equals(exchange.fromToken) &amp;&amp; USDC_ADDRESS.equals(exchange.toToken)
+                &amp;&amp; exchange.fromAmount &gt; <span class="hljs-number">0</span>) {
+                solPrice = exchange.toAmount / exchange.fromAmount;
+            } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (USDC_ADDRESS.equals(exchange.fromToken) &amp;&amp; SOL_ADDRESS.equals(exchange.toToken)
+                &amp;&amp; exchange.toAmount &gt; <span class="hljs-number">0</span>) {
+                solPrice = exchange.fromAmount / exchange.toAmount;
+            }
+            <span class="hljs-keyword">if</span> (solPrice &gt; <span class="hljs-number">0</span>) {
+                out.collect(<span class="hljs-keyword">new</span> PoolPriceData(exchange.timestamp, solPrice, exchange.pair));
+            }
+        }
+    }
 }
 </code></pre>
-<p>This let us test locally against Kafka and then just flip a switch to send it to our analytics warehouse in production.</p>
+<p>Then we used Flink&#39;s <code>BroadcastStream</code> to push that price to every parallel worker in the cluster:</p>
+<pre><code class="lang-java"><span class="hljs-keyword">BroadcastStream&lt;PoolPriceData&gt; </span><span class="hljs-keyword">broadcastPriceStream </span>= exchangeStream
+    .flatMap(new SolPriceExtractor())
+    .<span class="hljs-keyword">broadcast(priceStateDescriptor);
+</span>
+DataStream&lt;<span class="hljs-keyword">SwapWithPrice&gt; </span>streamWithSolPrice = exchangeStream
+    .connect(<span class="hljs-keyword">broadcastPriceStream)
+</span>    .process(new UsdValueCalculator())<span class="hljs-comment">;</span>
+</code></pre>
+<p>Inside <code>UsdValueCalculator</code>, we maintain a rolling window of the last 20 prices and use their average. Why 20? It balances responsiveness against noise. At our trading volumes, high-frequency wash trades can cause momentary price spikes that distort volume calculations. Averaging over 20 prices (which might span 200 to 500ms of actual trading) smooths those out without introducing meaningful lag for a metric that is already approximate. We considered a time-based window (the last 5 seconds for example), but that requires event-time watermarks and adds complexity for minimal gain -- 20 trades is simpler and robust enough at our volumes.</p>
+<p>The fallback matters too. When the job first starts, the broadcast state is empty. Rather than outputting records with a zero price or dropping them, we have a lightweight API call with a 60-second cache to bridge the gap:</p>
+<pre><code class="lang-java"><span class="hljs-attribute">if</span> (solPrice &lt;= <span class="hljs-number">0</span>) {
+    <span class="hljs-attribute">long</span> currentTime = System.currentTimeMillis();
+    <span class="hljs-attribute">if</span> (cachedApiSolPrice &gt; <span class="hljs-number">0</span> &amp;&amp; (currentTime - <span class="hljs-literal">last</span>ApiFetchTime) &lt; CACHE_DURATION_MS) {
+        <span class="hljs-attribute">solPrice</span> = cachedApiSolPrice;
+    } <span class="hljs-section">else</span> {
+        <span class="hljs-attribute">solPrice</span> = fetchSolPriceFromApi();
+        <span class="hljs-attribute">if</span> (solPrice &gt; <span class="hljs-number">0</span>) {
+            <span class="hljs-attribute">cachedApiSolPrice</span> = solPrice;
+            <span class="hljs-attribute">lastApiFetchTime</span> = currentTime;
+        }
+    }
+}
+</code></pre>
+<p>In practice, the fallback fires maybe twice per job restart -- once on cold start, and once if the broadcast state somehow drains. After that, the stream self-sustains.</p>
 <hr>
+<h2 id="2-solving-the-multi-key-join-problem">2. Solving the multi-key join problem</h2>
+<p>Once we had USD pricing flowing, we hit a subtler Flink constraint. Each swap has two token addresses that both need metadata enrichment: <code>fromToken</code> and <code>toToken</code>. A naive approach -- doing both lookups inside a single <code>map</code> function -- runs into the same external-call problem we just escaped. But the Flink-native approach has its own limitation: you can only <code>keyBy</code> on one key at a time.</p>
+<p>This is a hard architectural constraint in Flink. Partitioning a stream by a key means routing all records with the same key to the same task slot, which is what makes keyed state coherent. If you try to <code>keyBy</code> on two keys at once, you would need to duplicate records (sending each swap to both the <code>fromToken</code> slot and the <code>toToken</code> slot), which doubles your data volume and creates complex join logic downstream.</p>
+<p>Our solution was to turn the two-dimensional join into a sequential assembly line. Rather than trying to enrich both tokens at once, we enrich one at a time and carry the partial result forward.</p>
+<pre><code>SwapWithPrice
+    <span class="hljs-string">|</span>
+    <span class="hljs-string">| keyBy(fromToken)</span>
+    <span class="hljs-string">|</span>
+    +&lt;---- historicalSymbols.keyBy(address)
+    <span class="hljs-string">|</span>
+    v
+EnrichFromSymbolFunction
+    <span class="hljs-string">|</span>
+    <span class="hljs-string">| emits SwapWithFromSymbol  &lt;-- carries fromSymbol + original swap</span>
+    <span class="hljs-string">|</span>
+    <span class="hljs-string">| (network reshuffle: keyBy(toToken))</span>
+    <span class="hljs-string">|</span>
+    +&lt;---- historicalSymbols.keyBy(address)
+    <span class="hljs-string">|</span>
+    v
+EnrichToSymbolFunction
+    <span class="hljs-string">|</span>
+    <span class="hljs-string">| emits OutputSwapData (both symbols resolved)</span>
+</code></pre><h3 id="why-rocksdb">Why RocksDB</h3>
+<p>Before getting into the code, the state backend choice is worth explaining. Flink supports two main backends: the JVM heap (<code>HashMapStateBackend</code>) and RocksDB (<code>EmbeddedRocksDBStateBackend</code>). For this pipeline, we used RocksDB because token metadata is unbounded -- Solana has hundreds of thousands of tokens, with new ones launching daily. Keeping all that in JVM heap would cause GC pressure and eventually OOM errors. RocksDB stores state on local disk with an in-memory cache, so our per-task state can grow well beyond what heap allows, while still serving the common case (already-seen tokens) from memory.</p>
+<pre><code class="lang-java">env.setStateBackend(<span class="hljs-keyword">new</span> <span class="hljs-type">EmbeddedRocksDBStateBackend</span>(<span class="hljs-literal">true</span>));
+</code></pre>
+<p>The <code>true</code> argument enables incremental checkpointing, which is important for a long-running job -- full state snapshots at our data volume would be prohibitively slow.</p>
+<h3 id="pre-loading-state-from-starrocks">Pre-loading state from StarRocks</h3>
+<p>Rather than starting cold and hitting the fallback API for every token on day one, we pre-load known token metadata from our analytics warehouse at job startup. The Flink Table API makes this straightforward:</p>
+<pre><code class="lang-java">tEnv.executeSql(
+    "<span class="hljs-keyword">CREATE</span> <span class="hljs-keyword">TEMPORARY</span> <span class="hljs-keyword">TABLE</span> starrocks_token_metadata (<span class="hljs-string">" +
+    "</span>  <span class="hljs-string">`address`</span> <span class="hljs-keyword">STRING</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">`symbol`</span> <span class="hljs-keyword">STRING</span> <span class="hljs-string">" +
+    "</span>) <span class="hljs-keyword">WITH</span> (<span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'connector'</span> = <span class="hljs-string">'starrocks'</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'jdbc-url'</span> = <span class="hljs-string">'" + STARROCKS_JDBC_URL + "'</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'scan-url'</span> = <span class="hljs-string">'" + STARROCKS_LOAD_URL + "'</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'database-name'</span> = <span class="hljs-string">'" + STARROCKS_DATABASE + "'</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'table-name'</span> = <span class="hljs-string">'token_metadata'</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'username'</span> = <span class="hljs-string">'" + STARROCKS_USERNAME + "'</span>, <span class="hljs-string">" +
+    "</span>  <span class="hljs-string">'password'</span> = <span class="hljs-string">'" + STARROCKS_PASSWORD + "'</span><span class="hljs-string">" +
+    "</span>)<span class="hljs-string">"
+);
+DataStream&lt;TokenData&gt; historicalSymbols = tEnv.toDataStream(
+    tEnv.from("</span>starrocks_token_metadata<span class="hljs-string">"), TokenData.class
+);</span>
+</code></pre>
+<p>This stream is connected into both enrichment stages via <code>KeyedCoProcessFunction</code>. The <code>processElement2</code> handler pre-populates the RocksDB cache for any token address we have seen before, so by the time live events arrive, most lookups are already warm.</p>
+<h3 id="stage-1-enrich-the-fromtoken">Stage 1: Enrich the fromToken</h3>
+<p>We partition by <code>fromToken</code> and connect the metadata stream partitioned by <code>address</code>. The enricher checks RocksDB first; only on a cache miss does it call the external API, and then immediately saves the result:</p>
+<pre><code class="lang-java">DataStream&lt;SwapWithFromSymbol&gt; streamWithFromSymbol = streamWithSolPrice
+    .keyBy(value -&gt; value.exchange.fromToken != <span class="hljs-keyword">null</span>
+        ? value.exchange.fromToken : UNKNOWN_TOKEN_ADDRESS)
+    .connect(historicalSymbols.keyBy(s -&gt; s.address != <span class="hljs-keyword">null</span>
+        ? s.address : UNKNOWN_TOKEN_ADDRESS))
+    .process(<span class="hljs-keyword">new</span> EnrichFromSymbolFunction())
+    .name(<span class="hljs-string">"EnrichFromSymbol"</span>);
+</code></pre>
+<p>The result is a <code>SwapWithFromSymbol</code> -- a wrapper that carries both the original <code>SwapWithPrice</code> and the resolved <code>fromSymbol</code> string.</p>
+<h3 id="the-network-reshuffle">The network reshuffle</h3>
+<p>Once Stage 1 emits <code>SwapWithFromSymbol</code>, we can now <code>keyBy</code> on <code>toToken</code>. This triggers a network shuffle: Flink redistributes the stream so all records with the same <code>toToken</code> land on the same task slot. Yes, this is a network hop, but it is a single one, and it is unavoidable when you need coherent keyed state for two different keys. The alternative -- hitting a remote service for every record -- is multiple network hops per record with no caching benefit.</p>
+<h3 id="stage-2-enrich-the-totoken">Stage 2: Enrich the toToken</h3>
+<pre><code class="lang-java">DataStream&lt;OutputSwapData&gt; enrichedStream = streamWithFromSymbol
+    .keyBy(value -&gt; value.swap.exchange.toToken != <span class="hljs-keyword">null</span>
+        ? value.swap.exchange.toToken : UNKNOWN_TOKEN_ADDRESS)
+    .connect(historicalSymbols.keyBy(s -&gt; s.address != <span class="hljs-keyword">null</span>
+        ? s.address : UNKNOWN_TOKEN_ADDRESS))
+    .process(<span class="hljs-keyword">new</span> EnrichToSymbolFunction())
+    .name(<span class="hljs-string">"EnrichToSymbol"</span>);
+</code></pre>
+<p>The same RocksDB lookup pattern applies. Once both enrichments are done, we have a fully resolved <code>OutputSwapData</code> with the token symbols and USD volume.</p>
+<h3 id="the-shared-enricher-logic">The shared enricher logic</h3>
+<p>Both enrichment functions share a base class to avoid duplicating the API call and state management code:</p>
+<pre><code class="lang-java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">BaseSymbolEnricher</span> <span class="hljs-keyword">implements</span> <span class="hljs-title">Serializable</span> </span>{
+    <span class="hljs-keyword">protected</span> <span class="hljs-keyword">transient</span> ValueState&lt;String&gt; symbolState;
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">transient</span> HttpClient httpClient;
+
+    <span class="hljs-function"><span class="hljs-keyword">protected</span> String <span class="hljs-title">fetchSymbolFromApi</span><span class="hljs-params">(String address)</span> </span>{
+        <span class="hljs-keyword">if</span> (SOL_ADDRESS.equals(address)) <span class="hljs-keyword">return</span> <span class="hljs-string">"SOL"</span>;
+        <span class="hljs-comment">// HTTP call to token metadata API, returns symbol or "UNKNOWN"</span>
+    }
+}
+</code></pre>
+<p>Note the <code>transient</code> keyword on the HTTP client and state handle. Flink serializes operator state across the cluster; Java&#39;s <code>HttpClient</code> is not serializable. Declaring it <code>transient</code> means Flink will skip it during serialization, and the <code>open()</code> method re-initializes it when the task starts on each worker.</p>
+<hr>
+<h2 id="3-usd-volume-and-token-price-calculation">3. USD volume and token price calculation</h2>
+<p>Once the enriched record is assembled, we calculate two derived metrics.</p>
+<p>USD volume is the dollar value of the swap. The logic checks which side of the trade is a stable or known-price asset:</p>
+<pre><code class="lang-java"><span class="hljs-function"><span class="hljs-keyword">private</span> <span class="hljs-keyword">double</span> <span class="hljs-title">calculateUsdAmount</span>(<span class="hljs-params">ExchangeData e, <span class="hljs-keyword">double</span> solPrice</span>) </span>{
+    <span class="hljs-keyword">if</span> (solPrice &lt;= <span class="hljs-number">0</span>) <span class="hljs-keyword">return</span> <span class="hljs-number">0.0</span>;
+    <span class="hljs-keyword">if</span> (USDC_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken) || USDT_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken))
+        <span class="hljs-keyword">return</span> e.fromAmount;
+    <span class="hljs-keyword">if</span> (USDC_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken) || USDT_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken))
+        <span class="hljs-keyword">return</span> e.toAmount;
+    <span class="hljs-keyword">if</span> (SOL_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken)) <span class="hljs-keyword">return</span> e.fromAmount * solPrice;
+    <span class="hljs-keyword">if</span> (SOL_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken))   <span class="hljs-keyword">return</span> e.toAmount * solPrice;
+    <span class="hljs-keyword">return</span> <span class="hljs-number">0.0</span>;
+}
+</code></pre>
+<p>Token price is the per-token dollar price of the non-quote asset in the swap:</p>
+<pre><code class="lang-java"><span class="hljs-function"><span class="hljs-keyword">private</span> <span class="hljs-keyword">double</span> <span class="hljs-title">calculateTokenPrice</span>(<span class="hljs-params">ExchangeData e, <span class="hljs-keyword">double</span> usdVolume, <span class="hljs-keyword">double</span> solPrice</span>) </span>{
+    boolean fromIsQuote = SOL_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken)
+        || USDC_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken)
+        || USDT_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken);
+    boolean toIsQuote = SOL_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken)
+        || USDC_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken)
+        || USDT_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken);
+    <span class="hljs-keyword">if</span> (!fromIsQuote &amp;&amp; e.fromAmount &gt; <span class="hljs-number">0</span>) <span class="hljs-keyword">return</span> usdVolume / e.fromAmount;
+    <span class="hljs-keyword">if</span> (!toIsQuote   &amp;&amp; e.toAmount &gt; <span class="hljs-number">0</span>)   <span class="hljs-keyword">return</span> usdVolume / e.toAmount;
+    <span class="hljs-keyword">if</span> (SOL_ADDRESS.<span class="hljs-keyword">equals</span>(e.fromToken) || SOL_ADDRESS.<span class="hljs-keyword">equals</span>(e.toToken)) <span class="hljs-keyword">return</span> solPrice;
+    <span class="hljs-keyword">return</span> <span class="hljs-number">0.0</span>;
+}
+</code></pre>
+<p>These two fields make downstream aggregations simple. A <code>SUM(usdVolume)</code> in StarRocks gives you 24h volume without any joins.</p>
+<hr>
+<h2 id="4-dynamic-topology-with-parameterized-sinks">4. Dynamic topology with parameterized sinks</h2>
+<p>During development, we wanted to validate output by consuming from Kafka directly. In production, we needed data in StarRocks for our dashboards. Redeploying with code changes for this distinction is wasteful and error-prone.</p>
+<p>We parameterized the sink selection at job startup:</p>
+<pre><code class="lang-java">String sinkType = <span class="hljs-built_in">params</span>.get(<span class="hljs-string">"SINK_TYPE"</span>, <span class="hljs-string">"ALL"</span>).toUpperCase();
+
+<span class="hljs-keyword">if</span> (<span class="hljs-string">"KAFKA"</span>.equals(sinkType)) {
+    jsonOutputStream.sinkTo(kafkaSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"Kafka Sink"</span>);
+} <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (<span class="hljs-string">"STARROCKS"</span>.equals(sinkType)) {
+    jsonOutputStream.addSink(starRocksJsonSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"StarRocks JSON Sink"</span>);
+} <span class="hljs-keyword">else</span> {
+    <span class="hljs-comment">// Default: write to both</span>
+    jsonOutputStream.sinkTo(kafkaSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"Kafka Sink"</span>);
+    jsonOutputStream.addSink(starRocksJsonSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"StarRocks JSON Sink"</span>);
+}
+</code></pre>
+<p>The <code>ALL</code> mode is useful when you are running two consumers in parallel -- one reading from Kafka for real-time alerting, one consuming from StarRocks for historical analysis. The topology handles fan-out without duplicating processing.</p>
+<p>The sink options map to deployment contexts:</p>
+<pre><code><span class="hljs-attr">SINK_TYPE</span>=KAFKA      --&gt; local dev / integration testing
+<span class="hljs-attr">SINK_TYPE</span>=STARROCKS  --&gt; production analytics <span class="hljs-literal">on</span>ly
+<span class="hljs-attr">SINK_TYPE</span>=ALL        --&gt; production with real-time alerting + analytics
+</code></pre><hr>
 <h2 id="what-we-learned">What we learned</h2>
-<p>By ignoring the urge to just throw Redis at the problem, we kept our data gravity contained within our compute nodes. If you are dealing with high-throughput streams, just remember:</p>
-<ul>
-<li><strong>Listen to your own noise:</strong> Use Broadcast State to extract metadata hidden inside your primary stream.</li>
-<li><strong>Reshape mid-flight:</strong> If you have a multi-key join, just split it into an assembly line of sequential shuffles.</li>
-<li><strong>Parameterize your topology:</strong> Decouple your logic from the infrastructure so you arent locked into one storage layer.</li>
-</ul>
-<p>It makes the whole pipeline way easier to manage once you stop relying on external stuff for every little thing.</p>
+<p>The operational lesson here is bigger than any single Flink API. When you are building high-throughput pipelines, the instinct to reach for Redis, Memcached, or an external service for every enrichment step is a trap. Those tools have their place, but they add network hops, connection pools, and operational overhead to every single record you process.</p>
+<p>Flink&#39;s stateful primitives exist to eliminate those hops. The patterns we landed on:</p>
+<p><strong>Broadcast state for volatile, shared data.</strong> If a value changes frequently but every worker needs the latest version -- a price, a config flag, a threshold -- broadcast it. The source can be the stream itself. Don&#39;t poll an external service.</p>
+<p><strong>Sequential keyed joins for multi-dimensional enrichment.</strong> If you need to join on two different keys, pipeline the enrichments. Each stage handles one key with coherent local state. The network shuffle between stages is the cost of correctness, and it is a fixed cost per record rather than a variable external call.</p>
+<p><strong>RocksDB for unbounded state.</strong> If your key space grows without bound (new tokens, new users, new whatever), heap state will eventually fail. RocksDB with incremental checkpointing gives you disk-backed state that survives job restarts without the overhead of a full snapshot on every checkpoint.</p>
+<p><strong>Parameterize your topology.</strong> Decouple business logic from infrastructure choices at the operator level. The enrichment code has no idea whether its output goes to Kafka or StarRocks -- that is a deployment-time decision, not a code-time one.</p>
+<p>Running this in production for several months, our Kafka consumer lag stays flat, external API calls dropped by over 95%, and the pipeline handles traffic spikes without manual intervention. The whole thing runs as a single Flink job with no Redis cluster, no dedicated metadata service, and no external dependencies beyond Kafka and StarRocks.</p>
 
 
         </div>
