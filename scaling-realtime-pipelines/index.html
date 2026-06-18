@@ -5,7 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scaling Flink | Subal Ghimire</title>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-    
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true });
+    </script>
     <style>
         :root {
             --bg-color: #f4f4f0;
@@ -89,62 +92,32 @@
 <hr>
 <h2 id="pipeline-overview">Pipeline overview</h2>
 <p>Before getting into each component, here is the full shape of the pipeline:</p>
-<pre><code>+---------------------------+
-|<span class="hljs-string">   Kafka topic             </span>|
-|<span class="hljs-string">   exchange-data           </span>|
-+---------------------------+
-         |<span class="hljs-string">
-         </span>|<span class="hljs-string">  (raw ExchangeData events)
-         </span>|
-         +-----------------------------+
-         |<span class="hljs-string">                             </span>|
-         v                             v
-+-------------------+     +--------------------------+
-|<span class="hljs-string"> SolPriceExtractor </span>|<span class="hljs-string">     </span>|<span class="hljs-string">   UsdValueCalculator     </span>|
-|<span class="hljs-string"> flatMap on SOL/   </span>|<span class="hljs-string">----&gt;</span>|<span class="hljs-string">   BroadcastProcessFn     </span>|
-|<span class="hljs-string"> USDC pools        </span>|<span class="hljs-string"> bcast</span>|<span class="hljs-string">  rolling avg (last 20)  </span>|
-+-------------------+     +--------------------------+
-                                       |<span class="hljs-string">
-                                       </span>|<span class="hljs-string">  SwapWithPrice
-                                       v
-                   +-----------------------------------+
-                   </span>|<span class="hljs-string"> StarRocks token_metadata table    </span>|
-                   |<span class="hljs-string"> (pre-loaded as side input stream) </span>|
-                   +-----------------------------------+
-                           |<span class="hljs-string">               </span>|
-              keyBy(fromToken)         keyBy(address)
-                           |<span class="hljs-string">               </span>|
-                           v               |<span class="hljs-string">
-                   +---------------------------+
-                   </span>|<span class="hljs-string"> EnrichFromSymbolFunction  </span>|
-                   |<span class="hljs-string"> KeyedCoProcessFunction    </span>|
-                   |<span class="hljs-string"> RocksDB state cache       </span>|
-                   +---------------------------+
-                                |<span class="hljs-string">
-                                </span>|<span class="hljs-string">  SwapWithFromSymbol
-                                </span>|<span class="hljs-string">  (network reshuffle)
-                                v
-                   +---------------------------+
-                   </span>|<span class="hljs-string"> EnrichToSymbolFunction    </span>|
-                   |<span class="hljs-string"> KeyedCoProcessFunction    </span>|
-                   |<span class="hljs-string"> RocksDB state cache       </span>|
-                   +---------------------------+
-                                |<span class="hljs-string">
-                                </span>|<span class="hljs-string">  OutputSwapData
-                                v
-                   +---------------------------+
-                   </span>|<span class="hljs-string"> OutputSwapDataToJsonMapper</span>|
-                   +---------------------------+
-                          |<span class="hljs-string">           </span>|
-              +-----------+           +-----------+
-              v                                   v
-  +-------------------+               +---------------------+
-  |<span class="hljs-string"> Kafka sink        </span>|<span class="hljs-string">               </span>|<span class="hljs-string"> StarRocks sink      </span>|
-  |<span class="hljs-string"> enriched-swaps-v2 </span>|<span class="hljs-string">               </span>|<span class="hljs-string"> enriched_swaps_v2   </span>|
-  +-------------------+               +---------------------+
 
-  SINK_TYPE param selects KAFKA, STARROCKS, or ALL (default)
-</code></pre><p>Each section below maps to one stage of this diagram.</p>
+<div class="mermaid">
+graph TD
+    Source[Kafka: exchange-data] --> |Raw Events| Extractor[SolPriceExtractor]
+    Source --> |Raw Events| Calculator[UsdValueCalculator]
+    
+    Extractor -.-> |Broadcast Price| Calculator
+    Calculator --> |SwapWithPrice| EnrichFrom[EnrichFromSymbolFunction]
+    
+    Metadata[StarRocks Metadata] --> EnrichFrom
+    Metadata --> EnrichTo[EnrichToSymbolFunction]
+    
+    EnrichFrom --> |SwapWithFromSymbol| Shuffle[Network Reshuffle]
+    Shuffle --> EnrichTo
+    
+    EnrichTo --> |OutputSwapData| Mapper[OutputSwapDataToJsonMapper]
+    
+    Mapper --> Sink1[Kafka sink]
+    Mapper --> Sink2[StarRocks sink]
+
+    style EnrichFrom fill:#ffffff,stroke:#000,stroke-width:2px
+    style EnrichTo fill:#ffffff,stroke:#000,stroke-width:2px
+    style Calculator fill:#4ecdc4,stroke:#000,stroke-width:2px
+</div>
+
+<p>Each section below maps to one stage of this diagram.</p>
 <hr>
 <h2 id="1-building-our-own-in-stream-price-oracle">1. Building our own in-stream price oracle</h2>
 <p>The first instinct when you need a price feed is to call an external API -- DexScreener, CoinGecko, whatever. The problem is that at 10k events per second, even a cached API call with a 1-second TTL is still 10,000 cache reads per second. That is load you do not need to put on anything external.</p>
