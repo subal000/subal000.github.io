@@ -306,28 +306,6 @@ DataStream&lt;TokenData&gt; historicalSymbols = tEnv.toDataStream(
 }
 </code></pre>
 <p>These two fields make downstream aggregations simple. A <code>SUM(usdVolume)</code> in StarRocks gives you 24h volume without any joins.</p>
-<hr>
-<h2 id="4-dynamic-topology-with-parameterized-sinks">4. Dynamic topology with parameterized sinks</h2>
-<p>During development, we wanted to validate output by consuming from Kafka directly. In production, we needed data in StarRocks for our dashboards. Redeploying with code changes for this distinction is wasteful and error-prone.</p>
-<p>We parameterized the sink selection at job startup:</p>
-<pre><code class="lang-java">String sinkType = <span class="hljs-built_in">params</span>.get(<span class="hljs-string">"SINK_TYPE"</span>, <span class="hljs-string">"ALL"</span>).toUpperCase();
-
-<span class="hljs-keyword">if</span> (<span class="hljs-string">"KAFKA"</span>.equals(sinkType)) {
-    jsonOutputStream.sinkTo(kafkaSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"Kafka Sink"</span>);
-} <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (<span class="hljs-string">"STARROCKS"</span>.equals(sinkType)) {
-    jsonOutputStream.addSink(starRocksJsonSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"StarRocks JSON Sink"</span>);
-} <span class="hljs-keyword">else</span> {
-    <span class="hljs-comment">// Default: write to both</span>
-    jsonOutputStream.sinkTo(kafkaSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"Kafka Sink"</span>);
-    jsonOutputStream.addSink(starRocksJsonSink).<span class="hljs-built_in">name</span>(<span class="hljs-string">"StarRocks JSON Sink"</span>);
-}
-</code></pre>
-<p>The <code>ALL</code> mode is useful when you are running two consumers in parallel -- one reading from Kafka for real-time alerting, one consuming from StarRocks for historical analysis. The topology handles fan-out without duplicating processing.</p>
-<p>The sink options map to deployment contexts:</p>
-<pre><code><span class="hljs-attr">SINK_TYPE</span>=KAFKA      --&gt; local dev / integration testing
-<span class="hljs-attr">SINK_TYPE</span>=STARROCKS  --&gt; production analytics <span class="hljs-literal">on</span>ly
-<span class="hljs-attr">SINK_TYPE</span>=ALL        --&gt; production with real-time alerting + analytics
-</code></pre><hr>
 <h2 id="what-we-learned">What we learned</h2>
 <p>The operational lesson here is bigger than any single Flink API. When you are building high-throughput pipelines, the instinct to reach for Redis, Memcached, or an external service for every enrichment step is a trap. Those tools have their place, but they add network hops, connection pools, and operational overhead to every single record you process.</p>
 <p>Flink&#39;s stateful primitives exist to eliminate those hops. The patterns we landed on:</p>
