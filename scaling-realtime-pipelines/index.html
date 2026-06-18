@@ -123,20 +123,20 @@ graph TD
 <p>The first instinct when you need a price feed is to call an external API -- DexScreener, CoinGecko, whatever. The problem is that at 10k events per second, even a cached API call with a 1-second TTL is still 10,000 cache reads per second. That is load you do not need to put on anything external.</p>
 <p>The price was already inside our stream. Because high-liquidity pools like the SOL/USDC pair on Orca trade constantly, every few milliseconds there is a swap event that implicitly encodes the current market price. If someone swaps 15.5 SOL for 2100.25 USDC, the price of SOL at that moment is <code>2100.25 / 15.5 = ~$135.50</code>. We were throwing that information away.</p>
 <p>We fixed this with a two-step pattern: extract, then broadcast.</p>
-<pre><code>Raw event stream
-       <span class="hljs-string">|</span>
-       <span class="hljs-string">| flatMap (filter to known SOL/USDC pools)</span>
-       v
-  PoolPriceData stream
-       <span class="hljs-string">|</span>
-       <span class="hljs-string">| .broadcast(priceStateDescriptor)</span>
-       v
-  BroadcastStream&lt;PoolPriceData&gt;
-       <span class="hljs-string">|</span>
-       <span class="hljs-string">| .connect(exchangeStream).process(UsdValueCalculator)</span>
-       v
-  SwapWithPrice stream
-</code></pre><p>First, we defined the pools we trusted as price sources -- high-volume, well-established SOL/USDC and SOL/USDT pools where the price signal is reliable:</p>
+
+<div class="mermaid">
+graph TD
+    Raw[Raw Event Stream] --> |flatMap| Filter[Filter to SOL/USDC Pools]
+    Filter --> |Extract| PoolData[PoolPriceData Stream]
+    PoolData --> |broadcast| Bcast[BroadcastStream]
+    Bcast --> |connect| Calc[UsdValueCalculator]
+    Exchange[ExchangeStream] --> |connect| Calc
+    Calc --> Out[SwapWithPrice Stream]
+
+    style Bcast fill:#f9f,stroke:#333
+    style Calc fill:#4ecdc4,stroke:#333
+</div>
+<p>First, we defined the pools we trusted as price sources -- high-volume, well-established SOL/USDC and SOL/USDT pools where the price signal is reliable:</p>
 <pre><code class="lang-java"><span class="hljs-keyword">final</span> <span class="hljs-keyword">static</span> <span class="hljs-built_in">Set</span>&lt;<span class="hljs-built_in">String</span>&gt; SOL_USDC_POOLS = <span class="hljs-keyword">new</span> HashSet&lt;&gt;(Arrays.asList(
     <span class="hljs-string">"Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"</span>,
     <span class="hljs-string">"58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"</span>,
@@ -194,26 +194,27 @@ DataStream&lt;<span class="hljs-keyword">SwapWithPrice&gt; </span>streamWithSolP
 <p>Once we had USD pricing flowing, we hit a subtler Flink constraint. Each swap has two token addresses that both need metadata enrichment: <code>fromToken</code> and <code>toToken</code>. A naive approach -- doing both lookups inside a single <code>map</code> function -- runs into the same external-call problem we just escaped. But the Flink-native approach has its own limitation: you can only <code>keyBy</code> on one key at a time.</p>
 <p>This is a hard architectural constraint in Flink. Partitioning a stream by a key means routing all records with the same key to the same task slot, which is what makes keyed state coherent. If you try to <code>keyBy</code> on two keys at once, you would need to duplicate records (sending each swap to both the <code>fromToken</code> slot and the <code>toToken</code> slot), which doubles your data volume and creates complex join logic downstream.</p>
 <p>Our solution was to turn the two-dimensional join into a sequential assembly line. Rather than trying to enrich both tokens at once, we enrich one at a time and carry the partial result forward.</p>
-<pre><code>SwapWithPrice
-    <span class="hljs-string">|</span>
-    <span class="hljs-string">| keyBy(fromToken)</span>
-    <span class="hljs-string">|</span>
-    +&lt;---- historicalSymbols.keyBy(address)
-    <span class="hljs-string">|</span>
-    v
-EnrichFromSymbolFunction
-    <span class="hljs-string">|</span>
-    <span class="hljs-string">| emits SwapWithFromSymbol  &lt;-- carries fromSymbol + original swap</span>
-    <span class="hljs-string">|</span>
-    <span class="hljs-string">| (network reshuffle: keyBy(toToken))</span>
-    <span class="hljs-string">|</span>
-    +&lt;---- historicalSymbols.keyBy(address)
-    <span class="hljs-string">|</span>
-    v
-EnrichToSymbolFunction
-    <span class="hljs-string">|</span>
-    <span class="hljs-string">| emits OutputSwapData (both symbols resolved)</span>
-</code></pre><h3 id="why-rocksdb">Why RocksDB</h3>
+
+<div class="mermaid">
+graph TD
+    Input[SwapWithPrice] --> K1{keyBy fromToken}
+    K1 --> Enrich1[EnrichFromSymbolFunction]
+    Symbols1[(HistoricalSymbols)] --> |keyBy address| Enrich1
+    
+    Enrich1 --> |SwapWithFromSymbol| Shuffle[Network Reshuffle]
+    
+    Shuffle --> K2{keyBy toToken}
+    K2 --> Enrich2[EnrichToSymbolFunction]
+    Symbols2[(HistoricalSymbols)] --> |keyBy address| Enrich2
+    
+    Enrich2 --> Output[OutputSwapData]
+
+    style Shuffle fill:#ff9f43,stroke:#333,stroke-width:3px,stroke-dasharray: 5 5
+    style Enrich1 fill:#f9f,stroke:#333
+    style Enrich2 fill:#f9f,stroke:#333
+</div>
+
+<h3 id="why-rocksdb">Why RocksDB</h3>
 <p>Before getting into the code, the state backend choice is worth explaining. Flink supports two main backends: the JVM heap (<code>HashMapStateBackend</code>) and RocksDB (<code>EmbeddedRocksDBStateBackend</code>). For this pipeline, we used RocksDB because token metadata is unbounded -- Solana has hundreds of thousands of tokens, with new ones launching daily. Keeping all that in JVM heap would cause GC pressure and eventually OOM errors. RocksDB stores state on local disk with an in-memory cache, so our per-task state can grow well beyond what heap allows, while still serving the common case (already-seen tokens) from memory.</p>
 <pre><code class="lang-java">env.setStateBackend(<span class="hljs-keyword">new</span> <span class="hljs-type">EmbeddedRocksDBStateBackend</span>(<span class="hljs-literal">true</span>));
 </code></pre>
