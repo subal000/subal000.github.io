@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scaling Flink | Subal Ghimire</title>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-color: #f4f4f0;
+            --text-main: #000000;
+            --accent-blue: #4ecdc4;
+            --border-thick: 3px solid #000000;
+            --shadow-hard: 5px 5px 0px #000000;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Space Grotesk', sans-serif;
+            line-height: 1.6;
+            padding: 4rem 2rem;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-bottom: 2rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            border: var(--border-thick);
+            padding: 0.5rem 1rem;
+            background: #fff;
+            text-decoration: none;
+            color: black;
+            box-shadow: 3px 3px 0 #000;
+        }
+
+        .card {
+            background: #ffffff;
+            border: var(--border-thick);
+            box-shadow: var(--shadow-hard);
+            padding: 2.5rem;
+            margin-bottom: 3rem;
+        }
+
+        h1 { font-size: 3rem; text-transform: uppercase; margin-bottom: 2rem; line-height: 1.1; }
+        h2 { margin: 3rem 0 1.5rem 0; text-transform: uppercase; border-bottom: var(--border-thick); display: inline-block; }
+        
+        pre { 
+            background: #000; color: #fff; padding: 1.5rem; 
+            border: var(--border-thick); overflow-x: auto; 
+        }
+        code { font-family: monospace; }
+        
+        li { margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+
+    <a href="/" class="back-link">← BACK HOME</a>
+
+    <div class="card">
+    <h1 id="how-we-handled-10k-events-per-second-in-flink-without-crashing-our-db">How we handled 10k events per second in Flink without crashing our DB</h1>
+<p>When you are processing thousands of financial events every second from Kafka, you quickly realize the biggest enemy is not the math, it is network latency.</p>
+<p>To get useful data out of our stream, we had to do three things for every single transaction in real time:</p>
+<ol>
+<li>Calculate the USD value using a volatile price.</li>
+<li>Map the fromToken to a human-readable name.</li>
+<li>Map the toToken to a human-readable name.</li>
+</ol>
+<p>The easy way is just writing a map function that hits an API or Redis for every record. That works fine on your laptop with 5 events a second. But when you hit 10k events a second in production, your database connections just give up, you burn through your API limits, and your Kafka lag shoots through the roof.</p>
+<p>We fixed this by using Flink’s built-in stateful features to make a self-sustaining pipeline. Here is how we got rid of the external network calls and handled complex, multi-key joins right in the cluster memory.</p>
+<hr>
+<h2 id="the-setup-dex-swaps">The setup: DEX swaps</h2>
+<p>To give you an idea of the data we were dealing with, we were processing real-time DEX swap data from the Solana blockchain, flowing out of a Kafka topic.</p>
+<p>A raw payload looks like this:</p>
+<pre><code class="lang-json">{
+  <span class="hljs-attr">"signature"</span>: <span class="hljs-string">"3ucNos4Nbum..."</span>,
+  <span class="hljs-attr">"from_mint"</span>: <span class="hljs-string">"So11111111111111111111111111111111111111112"</span>,
+  <span class="hljs-attr">"to_mint"</span>: <span class="hljs-string">"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"</span>,
+  <span class="hljs-attr">"from_amount"</span>: <span class="hljs-number">15.5</span>,
+  <span class="hljs-attr">"to_amount"</span>: <span class="hljs-number">2100.25</span>
+}
+</code></pre>
+<p>This payload is small and fast. But to make it useful for analytics in StarRocks, we need those token symbols (turning <code>So1111...</code> into <code>SOL</code>) and the dollar value. Since new tokens pop up all the time, we couldnt just hardcode them. We had to build something dynamic that didnt rely on blocking network calls.</p>
+<hr>
+<h2 id="1-building-our-own-in-stream-price-oracle">1. Building our own in-stream price oracle</h2>
+<p>Instead of reaching out to a price API for every event, we realized the market price was already inside our stream because of the high liquidity trading pools.</p>
+<p>We used a two step pattern: <strong>Extract and Broadcast.</strong></p>
+<p>We skimmed high volume pools using a flat-mapper (<code>SolPriceExtractor</code>). Whenever a trade between our main asset and a stablecoin happened, we calculated the price and threw it into a pricing stream. Then we used Flink&#39;s <code>BroadcastStream</code> to push that price to every parallel worker in the cluster, keeping the state local to the execution memory.</p>
+<pre><code class="lang-java">// Skim the price out of the raw traffic <span class="hljs-keyword">and </span><span class="hljs-keyword">broadcast </span><span class="hljs-keyword">it
+</span><span class="hljs-keyword">BroadcastStream&lt;PoolPriceData&gt; </span><span class="hljs-keyword">broadcastPriceStream </span>= exchangeStream
+        .flatMap(new SolPriceExtractor())
+        .<span class="hljs-keyword">broadcast(priceStateDescriptor);
+</span>
+// Connect <span class="hljs-keyword">it </span><span class="hljs-keyword">back </span>to the main processing engine
+<span class="hljs-symbol">DataStream</span>&lt;SwapWithPrice&gt; <span class="hljs-keyword">streamWithSolPrice </span>= exchangeStream
+        .connect(<span class="hljs-keyword">broadcastPriceStream)
+</span>        .process(new UsdValueCalculator())<span class="hljs-comment">;</span>
+</code></pre>
+<p>To keep things smooth, our <code>UsdValueCalculator</code> maintains a rolling list of the last 20 prices in memory. By averaging this, we get zero-latency pricing. If the pipeline just started and the state was empty, we had a simple defensive fallback that hit an API with a 60 second cache, just enough to keep the stream moving until the local broadcast state caught up.</p>
+<hr>
+<h2 id="2-solving-the-multi-key-join-paradox">2. Solving the multi-key join paradox</h2>
+<p>Once we had the pricing, we hit a Flink bottleneck. Each swap event needs metadata for two distinct tokens (<code>fromToken</code> and <code>toToken</code>).</p>
+<p>The problem is that in Flink, you can only <code>keyBy</code> on one key at a time. You cant route a single record to two places at once without causing massive network shuffles or data duplication. We fixed this by turning the enrichment into a two-stage assembly line.</p>
+<ul>
+<li><strong>Stage 1:</strong> We partition the stream by <code>fromToken</code> and route it to <code>EnrichFromSymbolFunction</code>. It checks local RocksDB state (pre-loaded from our analytics warehouse). If it hits, it appends the symbol. If not, it hits an API and saves it for next time.</li>
+<li><strong>The handoff:</strong> We wrap the result in a temporary <code>SwapWithFromSymbol</code> POJO. Then, we force the stream to <strong>reshuffle</strong> across the network, this time using the <code>toToken</code> as our routing key.</li>
+<li><strong>Stage 2:</strong> The stream hits <code>EnrichToSymbolFunction</code>. It performs the same RocksDB lookup for the second token.</li>
+</ul>
+<p>By breaking a multi-dimensional join into this pipelined sequence, we kept everything in memory and avoided the massive cost of hitting a database twice for every single row.</p>
+<hr>
+<h2 id="3-dynamic-topology">3. Dynamic topology</h2>
+<p>Finally, we wanted to be able to change where our data lands without rewriting our code. We added a simple parameter <code>SINK_TYPE</code> that lets us decide where the data goes when we deploy.</p>
+<pre><code class="lang-java">String sinkType = <span class="hljs-keyword">params</span>.<span class="hljs-keyword">get</span>(<span class="hljs-string">"SINK_TYPE"</span>, <span class="hljs-string">"kafka"</span>);
+
+<span class="hljs-keyword">if</span> (<span class="hljs-string">"kafka"</span>.equalsIgnoreCase(sinkType)) {
+    enrichedStream.sinkTo(createKafkaSink(<span class="hljs-keyword">params</span>));
+} <span class="hljs-function"><span class="hljs-keyword">else</span> <span class="hljs-title">if</span> (<span class="hljs-params"><span class="hljs-string">"starrocks"</span>.equalsIgnoreCase(sinkType</span>)) </span>{
+    enrichedStream.addSink(createStarRocksSink(<span class="hljs-keyword">params</span>));
+}
+</code></pre>
+<p>This let us test locally against Kafka and then just flip a switch to send it to our analytics warehouse in production.</p>
+<hr>
+<h2 id="what-we-learned">What we learned</h2>
+<p>By ignoring the urge to just throw Redis at the problem, we kept our data gravity contained within our compute nodes. If you are dealing with high-throughput streams, just remember:</p>
+<ul>
+<li><strong>Listen to your own noise:</strong> Use Broadcast State to extract metadata hidden inside your primary stream.</li>
+<li><strong>Reshape mid-flight:</strong> If you have a multi-key join, just split it into an assembly line of sequential shuffles.</li>
+<li><strong>Parameterize your topology:</strong> Decouple your logic from the infrastructure so you arent locked into one storage layer.</li>
+</ul>
+<p>It makes the whole pipeline way easier to manage once you stop relying on external stuff for every little thing.</p>
+
+
+        </div>
+
+</body>
+</html>
